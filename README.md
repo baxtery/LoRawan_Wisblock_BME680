@@ -9,6 +9,8 @@ Save and Visualize the data with Node-Red, InfluxDB ad Grafana<br>
 at the end, create a dashboard<br>
 
 
+ <img src="2day_overview_wisblock_ttn_bme680.png" alt="grafana dashboad of TTN, bme680 and Wisblock"> 
+
 RAK Hardware documentation<br>
 https://docs.rakwireless.com/Product-Categories/WisBlock/ <br>
 
