@@ -1,0 +1,443 @@
+/**
+ * @file Environment_Monitoring.ino
+ * @author rakwireless.com
+ * @brief This sketch demonstrate how to get environment data from BME680
+ *    and send the data to lora gateway.
+ * @version 0.1
+ * @date 2020-07-28
+ * 
+ * @copyright Copyright (c) 2020
+ * 
+ * @note RAK5005-O GPIO mapping to RAK4631 GPIO ports
+ * IO1 <-> P0.17 (Arduino GPIO number 17)
+ * IO2 <-> P1.02 (Arduino GPIO number 34)
+ * IO3 <-> P0.21 (Arduino GPIO number 21)
+ * IO4 <-> P0.04 (Arduino GPIO number 4)
+ * IO5 <-> P0.09 (Arduino GPIO number 9)
+ * IO6 <-> P0.10 (Arduino GPIO number 10)
+ * SW1 <-> P0.01 (Arduino GPIO number 1)
+ */
+//---------------------------------------------------------
+// Decoding in the TTN console:
+//---------------------------------------------------------
+/**
+function Decoder(bytes, port) {
+  // Decode an uplink message from a buffer
+  // (array) of bytes to an object of fields.
+  var decoded = {};
+
+  // if (port === 1) decoded.led = bytes[0];function Decoder(bytes, port) {
+  var TEMP    = (bytes[1] << 8)  + bytes[2];
+  var HUM     = (bytes[3] << 8)  + bytes[4];  
+  var PRESS   = (bytes[5] <<24) + (bytes[6] <<16) + (bytes[7] <<8)   + bytes[8];
+  var GAS     = (bytes[9] <<24) + (bytes[10] <<16) + (bytes[11] <<8)   + bytes[12];
+  
+  return {
+  Temperature:     TEMP,
+  Humidity:        HUM,
+  Pressure:        PRESS,
+  GAS:             GAS,
+  };
+  
+}
+*/
+//---------------------------------------------------------
+#include <Arduino.h>
+#include <LoRaWan-RAK4630.h> //http://librarymanager/ALL#SX126x-Arduino
+#include <SPI.h>
+//---------------------------------------------------------
+// Bosch BME680 BSEC Library for IAQ
+//---------------------------------------------------------
+#include "bsec.h"   //http://librarymanager/All#BSEC_BME680
+// Helper functions declarations
+void checkIaqSensorStatus(void);
+void errLeds(void);
+// Create an object of the class Bsec
+Bsec iaqSensor;
+String output;
+//---------------------------------------------------------
+
+// RAK4630 supply two LED
+
+//greenled
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 35
+#endif
+//blueled
+#ifndef LED_BUILTIN2
+#define LED_BUILTIN2 36
+#endif
+
+
+
+bool doOTAA = true;
+#define REGION_EU868
+#define SCHED_MAX_EVENT_DATA_SIZE APP_TIMER_SCHED_EVENT_DATA_SIZE /**< Maximum size of scheduler events. */
+#define SCHED_QUEUE_SIZE 60										  /**< Maximum number of events in the scheduler queue. */
+#define LORAWAN_DATERATE DR_5									  /*LoRaMac datarates definition, from DR_0 to DR_5*/
+#define LORAWAN_TX_POWER TX_POWER_10								  /*LoRaMac tx power definition, from TX_POWER_0 to TX_POWER_15*/
+#define JOINREQ_NBTRIALS 3										  /**< Number of trials for the join request. */
+#define LORAWAN_ADR LORAWAN_ADR_OFF   /*ADR on will cause downlink by default o adjust ADR*/
+DeviceClass_t gCurrentClass = CLASS_A;							  /* class definition*/
+lmh_confirm gCurrentConfirm = LMH_UNCONFIRMED_MSG;          /* confirm/unconfirm packet definition---changed from LMH_CONFIRMED_MSG */ 
+uint8_t gAppPort = LORAWAN_APP_PORT;							  /* data port*/
+
+/**@brief Structure containing LoRaWan parameters, needed for lmh_init()
+ */
+static lmh_param_t lora_param_init = {LORAWAN_ADR, LORAWAN_DATERATE, LORAWAN_PUBLIC_NETWORK, JOINREQ_NBTRIALS, LORAWAN_TX_POWER, LORAWAN_DUTYCYCLE_OFF};
+
+// Foward declaration
+static void lorawan_has_joined_handler(void);
+static void lorawan_rx_handler(lmh_app_data_t *app_data);
+static void lorawan_confirm_class_handler(DeviceClass_t Class);
+static void send_lora_frame(void);
+
+/**@brief Structure containing LoRaWan callback functions, needed for lmh_init()
+*/
+static lmh_callback_t lora_callbacks = {BoardGetBatteryLevel, BoardGetUniqueId, BoardGetRandomSeed,
+										lorawan_rx_handler, lorawan_has_joined_handler, lorawan_confirm_class_handler};
+
+//OTAA keys all MSB ->>>rak_680_ttn
+uint8_t nodeDeviceEUI[8] = { 0x00, 0xF1, 0x24, 0x43, 0x37, 0x38, 0xC0, 0x28 };
+uint8_t nodeAppEUI[8] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x03, 0xA3, 0xF2 };
+uint8_t nodeAppKey[16] = { 0xE4, 0x76, 0x05, 0x05, 0x0A, 0x89, 0x6A, 0xBE, 0x33, 0xB1, 0x05, 0x7A, 0x16, 0xA0, 0xDB, 0xCD };
+
+// Private defination
+#define LORAWAN_APP_DATA_BUFF_SIZE 64										  /**< buffer size of the data to be transmitted. */
+#define LORAWAN_APP_INTERVAL 60000											  /**< Defines for user timer, the application data transmission interval. 20s, value in [ms]. */
+static uint8_t m_lora_app_data_buffer[LORAWAN_APP_DATA_BUFF_SIZE];			  //< Lora user application data buffer.
+static lmh_app_data_t m_lora_app_data = {m_lora_app_data_buffer, 0, 0, 0, 0}; //< Lora user application data structure.
+
+TimerEvent_t appTimer;
+static uint32_t timers_init(void);
+static uint32_t count = 0;
+static uint32_t count_fail = 0;
+
+//#define my_DEBUG  //comment if on battery
+//---------------------------------------------------------
+// Debugging included 
+//---------------------------------------------------------
+#ifdef my_DEBUG
+#define DEBUG_WRT(...) { Serial.write(__VA_ARGS__); }
+#define DEBUG_PRT(...) { Serial.print(__VA_ARGS__); }
+#define DEBUG_PLN(...) { Serial.println(__VA_ARGS__); }
+#define DEBUG_PRF(...) { Serial.printf(__VA_ARGS__); }
+#define DEBUG_BEGIN()  { Serial.begin(115200); while (!Serial){delay(10);}}
+#else
+#define DEBUG_WRT(...) {}
+#define DEBUG_PRT(...) {}
+#define DEBUG_PLN(...) {}
+#define DEBUG_PRF(...) {}
+#define DEBUG_BEGIN() {}
+#endif
+
+
+void setup()
+{
+  DEBUG_PLN("void setup");
+	pinMode(LED_BUILTIN, OUTPUT);
+	digitalWrite(LED_BUILTIN, LOW);
+  pinMode(LED_BUILTIN2, OUTPUT);
+  digitalWrite(LED_BUILTIN2, LOW);
+ 
+	// Initialize LoRa chip.
+	lora_rak4630_init();
+
+	// Initialize Serial for debug output
+	DEBUG_BEGIN();
+  /* bme680 init */
+  digitalWrite(LED_BUILTIN, HIGH);
+  bme680_init();
+  digitalWrite(LED_BUILTIN, LOW);
+  
+  DEBUG_PLN("=====================================");
+  DEBUG_PLN("Type: OTAA");
+
+#if defined(REGION_AS923)
+  DEBUG_PLN("Region: AS923");
+#elif defined(REGION_AU915)
+	DEBUG_PLN("Region: AU915");
+#elif defined(REGION_CN470)
+	DEBUG_PLN("Region: CN470");
+#elif defined(REGION_CN779)
+	DEBUG_PLN("Region: CN779");
+#elif defined(REGION_EU433)
+	DEBUG_PLN("Region: EU433");
+#elif defined(REGION_IN865)
+	DEBUG_PLN("Region: IN865");
+#elif defined(REGION_EU868)
+	DEBUG_PLN("Region: EU868");
+#elif defined(REGION_KR920)
+	DEBUG_PLN("Region: KR920");
+#elif defined(REGION_US915)
+	DEBUG_PLN("Region: US915");
+#elif defined(REGION_US915_HYBRID)
+	DEBUG_PLN("Region: US915_HYBRID");
+#else
+	DEBUG_PLN("Please define a region in the compiler options.");
+#endif
+	DEBUG_PLN("=====================================");
+  DEBUG_PRF("Battery:", BoardGetBatteryLevel);
+
+
+	//creat a user timer to send data to server period
+	uint32_t err_code;
+
+	err_code = timers_init();
+	if (err_code != 0)
+	{
+		DEBUG_PRF("timers_init failed - %d\n", err_code);
+	}
+
+	// Setup the EUIs and Keys
+	lmh_setDevEui(nodeDeviceEUI);
+	lmh_setAppEui(nodeAppEUI);
+	lmh_setAppKey(nodeAppKey);
+
+	// Initialize LoRaWan
+	err_code = lmh_init(&lora_callbacks, lora_param_init, doOTAA);
+	if (err_code != 0)
+	{
+		DEBUG_PRF("lmh_init failed - %d\n", err_code);
+	}
+
+	// Start Join procedure
+	lmh_join();
+}
+
+void loop()
+{
+	// Handle Radio events
+	Radio.IrqProcess();
+}
+
+/**@brief LoRa function for handling HasJoined event.
+ */
+void lorawan_has_joined_handler(void)
+{
+	DEBUG_PLN("OTAA Mode, Network Joined!");
+  delay(2000);
+
+	lmh_error_status ret = lmh_class_request(gCurrentClass);
+	if (ret == LMH_SUCCESS)
+	{
+  digitalWrite(LED_BUILTIN2, HIGH);
+		delay(1000);
+  digitalWrite(LED_BUILTIN2, LOW);
+		TimerSetValue(&appTimer, LORAWAN_APP_INTERVAL);
+		TimerStart(&appTimer);
+	}
+}
+
+/**@brief Function for handling LoRaWan received data from Gateway
+ *
+ * @param[in] app_data  Pointer to rx data
+ */
+void lorawan_rx_handler(lmh_app_data_t *app_data)
+{
+	DEBUG_PRF("LoRa Packet received on port %d, size:%d, rssi:%d, snr:%d, data:%s\n",
+				  app_data->port, app_data->buffsize, app_data->rssi, app_data->snr, app_data->buffer);
+}
+
+void lorawan_confirm_class_handler(DeviceClass_t Class)
+{
+	DEBUG_PRF("switch to class %c done\n", "ABC"[Class]);
+	// Informs the server that switch has occurred ASAP
+	m_lora_app_data.buffsize = 0;
+	m_lora_app_data.port = gAppPort;
+	lmh_send(&m_lora_app_data, gCurrentConfirm);
+}
+
+void send_lora_frame(void)
+{
+	if (lmh_join_status_get() != LMH_SET)
+	{
+		//Not joined, try again later
+  DEBUG_PRT("join failed");
+		return;
+	}
+  digitalWrite(LED_BUILTIN2, HIGH);
+	bme680_get();
+  digitalWrite(LED_BUILTIN2, LOW);
+  
+	lmh_error_status error = lmh_send(&m_lora_app_data, gCurrentConfirm);
+	if (error == LMH_SUCCESS)
+	{
+
+		count++;
+		DEBUG_PRF("lmh_send ok count %d\n", count);
+  digitalWrite(LED_BUILTIN2, LOW);
+	}
+	else
+	{
+		count_fail++;
+		DEBUG_PRF("lmh_send fail count %d\n", count_fail);
+	}
+}
+
+/**@brief Function for handling user timerout event.
+ */
+void tx_lora_periodic_handler(void)
+{
+  digitalWrite(LED_BUILTIN2, HIGH);
+	TimerSetValue(&appTimer, LORAWAN_APP_INTERVAL);
+	TimerStart(&appTimer);
+	DEBUG_PLN("Sending frame now...");
+	send_lora_frame();
+}
+
+/**@brief Function for the Timer initialization.
+ *
+ * @details Initializes the timer module. This creates and starts application timers.
+ */
+uint32_t timers_init(void)
+{
+	TimerInit(&appTimer, tx_lora_periodic_handler);
+	return 0;
+}
+
+void bme680_init()
+{
+  Wire.begin();
+  iaqSensor.begin(BME680_I2C_ADDR_PRIMARY, Wire);
+  output = "\nBSEC library version " + String(iaqSensor.version.major) + "." + String(iaqSensor.version.minor) + "." + String(iaqSensor.version.major_bugfix) + "." + String(iaqSensor.version.minor_bugfix);
+     DEBUG_PLN(output);
+  checkIaqSensorStatus();
+
+  bsec_virtual_sensor_t sensorList[10] = {
+    BSEC_OUTPUT_RAW_TEMPERATURE,
+    BSEC_OUTPUT_RAW_PRESSURE,
+    BSEC_OUTPUT_RAW_HUMIDITY,
+    BSEC_OUTPUT_RAW_GAS,
+    BSEC_OUTPUT_IAQ,
+    BSEC_OUTPUT_STATIC_IAQ,
+    BSEC_OUTPUT_CO2_EQUIVALENT,
+    BSEC_OUTPUT_BREATH_VOC_EQUIVALENT,
+    BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE,
+    BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,
+  };
+  iaqSensor.updateSubscription(sensorList, 10, BSEC_SAMPLE_RATE_LP);
+  checkIaqSensorStatus();
+  // Print the header
+  output = "Timestamp [ms], raw temperature [°C], pressure [hPa], raw relative humidity [%], gas [Ohm], IAQ, IAQ accuracy, temperature [°C], relative humidity [%], Static IAQ, CO2 equivalent, breath VOC equivalent";
+  DEBUG_PLN("=====================================");
+  DEBUG_PLN(output);
+
+
+}
+String data = "";
+void bme680_get()
+{
+  char oled_data[32] = {0};
+	DEBUG_PLN("bme680 getting ");
+	uint32_t i = 0;
+	memset(m_lora_app_data.buffer, 0, LORAWAN_APP_DATA_BUFF_SIZE);
+	m_lora_app_data.port = gAppPort;
+  DEBUG_PRT("memset iaq status : "); 
+  DEBUG_PLN(iaqSensor.bme680Status);
+  unsigned long time_trigger = millis();
+
+  if (iaqSensor.run())
+  { // If new data is available
+  DEBUG_PLN("===RUN OK");
+  double temp = iaqSensor.temperature;
+  double pres = iaqSensor.pressure;
+  double hum = iaqSensor.humidity;
+  uint32_t gas = iaqSensor.gasResistance;
+  double iaqr =  iaqSensor.iaq;
+  double iaqa =iaqSensor.iaqAccuracy;
+  double iaqs = iaqSensor.staticIaq;
+  uint32_t co2e =iaqSensor.co2Equivalent;
+  double voce =  iaqSensor.breathVocEquivalent;
+    output = String(time_trigger);
+    output += ", " + String(iaqSensor.rawTemperature);
+    output += ", " + String(iaqSensor.pressure);
+    output += ", " + String(iaqSensor.rawHumidity);
+    output += ", " + String(iaqSensor.gasResistance);
+    output += ", " + String(iaqSensor.iaq);
+    output += ", " + String(iaqSensor.iaqAccuracy);
+    output += ", " + String(iaqSensor.temperature);
+    output += ", " + String(iaqSensor.humidity);
+    output += ", " + String(iaqSensor.staticIaq);
+    output += ", " + String(iaqSensor.co2Equivalent);
+    output += ", " + String(iaqSensor.breathVocEquivalent);
+    DEBUG_PLN(output);
+//lora send ->>> just a test first
+  m_lora_app_data.buffsize = 1;
+  m_lora_app_data.buffer[1] = 0x01;
+  }
+  else
+  {
+  DEBUG_PLN("===RUN NOT OK");
+    checkIaqSensorStatus();
+  }
+
+
+/*
+
+	uint16_t t = temp * 100;
+	uint16_t h = hum * 100;
+	uint32_t pre = pres * 100;
+
+	//result: T=28.25C, RH=50.00%, P=958.57hPa, G=100406 Ohms
+	m_lora_app_data.buffer[i++] = 0x01;
+	m_lora_app_data.buffer[i++] = (uint8_t)(t >> 8);
+	m_lora_app_data.buffer[i++] = (uint8_t)t;
+	m_lora_app_data.buffer[i++] = (uint8_t)(h >> 8);
+	m_lora_app_data.buffer[i++] = (uint8_t)h;
+	m_lora_app_data.buffer[i++] = (uint8_t)((pre & 0xFF000000) >> 24);
+	m_lora_app_data.buffer[i++] = (uint8_t)((pre & 0x00FF0000) >> 16);
+	m_lora_app_data.buffer[i++] = (uint8_t)((pre & 0x0000FF00) >> 8);
+	m_lora_app_data.buffer[i++] = (uint8_t)(pre & 0x000000FF);
+	m_lora_app_data.buffer[i++] = (uint8_t)((gas & 0xFF000000) >> 24);
+	m_lora_app_data.buffer[i++] = (uint8_t)((gas & 0x00FF0000) >> 16);
+	m_lora_app_data.buffer[i++] = (uint8_t)((gas & 0x0000FF00) >> 8);
+	m_lora_app_data.buffer[i++] = (uint8_t)(gas & 0x000000FF);
+	m_lora_app_data.buffsize = i;
+ */
+}
+
+// Helper function definitions
+void checkIaqSensorStatus(void)
+{
+  if (iaqSensor.status != BSEC_OK)
+  {
+    if (iaqSensor.status < BSEC_OK)
+    {
+      output = "BSEC error code : " + String(iaqSensor.status);
+         DEBUG_PLN(output);
+      for (;;)
+        errLeds(); /* Halt in case of failure */
+    }
+    else
+    {
+      output = "BSEC warning code : " + String(iaqSensor.status);
+         DEBUG_PLN(output);
+    }
+  }
+
+  if (iaqSensor.bme680Status != BME680_OK)
+  {
+    if (iaqSensor.bme680Status < BME680_OK)
+    {
+      output = "BME680 error code : " + String(iaqSensor.bme680Status);
+         DEBUG_PLN(output);
+      for (;;)
+        errLeds(); /* Halt in case of failure */
+    }
+    else
+    {
+      output = "BME680 warning code : " + String(iaqSensor.bme680Status);
+         DEBUG_PLN(output);
+    }
+  }
+}
+
+void errLeds(void)
+{
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(100);
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(100);
+}
